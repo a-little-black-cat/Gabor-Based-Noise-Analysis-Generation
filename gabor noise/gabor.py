@@ -239,11 +239,12 @@ def userInputMode():
 
         #get extracted parameters from uploaded image and display them in the variation window
         if uploaded_parameters:
-            for i, param in enumerate(uploaded_parameters["components"]):
+            shown_components = uploaded_parameters["components"][:8]  # strongest bands only
+            for i, param in enumerate(shown_components):
                 ttk.Label(header_frame, text=f"Component {i + 1}: Frequency={param['frequency']:.6g}, Theta={np.rad2deg(param['theta']):.3f}, Sigma_X={param['sigma_x']:.6g}, Sigma_Y={param['sigma_y']:.6g}").grid(row=i, column=0, sticky="w", padx=12)
 
             palette_frame = ttk.LabelFrame(header_frame, text="Extracted Color Palette", padding=8)
-            palette_frame.grid(row=len(uploaded_parameters["components"]), column=0, sticky="ew", padx=12, pady=(8, 12))
+            palette_frame.grid(row=len(shown_components), column=0, sticky="ew", padx=12, pady=(8, 12))
             for j, color in enumerate(uploaded_parameters["palette"]):
                 red, green, blue = color["rgb"]
                 color_frame = ttk.Frame(palette_frame, padding=4)
@@ -350,7 +351,8 @@ def userInputMode():
                 {
                     "freq": component["frequency"],
                     "orientation": component["theta"],
-                    "bandwidth": 1.0 / max(component["sigma_x"], component["sigma_y"], 1e-6),
+                    # kernel() uses exp(-pi a^2 r^2); that matches a Gaussian of std sigma when a = 1/(sigma*sqrt(2*pi))
+                    "bandwidth": 1.0 / (np.sqrt(2.0 * np.pi) * max(component["sigma_x"], component["sigma_y"], 1e-6)),
                     "weight": component["energy"] / total_energy,
                 }
                 for component in components
@@ -386,14 +388,14 @@ def userInputMode():
                             crop = crop.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
 
                         base_texture = np.asarray(crop, dtype=np.float32) / 255.0
-                        synthesized = normalize(
-                            synthesize_variation(
-                                (size, size),
-                                lobes,
-                                n_impulses=400,
-                                seed=seed + image_index,
-                            )
+                        synthesized = synthesize_variation(
+                            (size, size),
+                            lobes,
+                            seed=seed + image_index,
                         )
+                        # unit-variance noise -> [0, 1] around 0.5 (clipped at +-3 sigma),
+                        # so a few extreme peaks cannot crush the contrast like min-max did
+                        synthesized = np.clip(synthesized / 6.0 + 0.5, 0.0, 1.0)
                         texture = np.clip(
                             base_texture + (synthesized[..., None] - 0.5) * 0.18,
                             0.0,
@@ -854,11 +856,12 @@ def find_lobes(n_lobes=6, power_spectrum=None):
 
 
 # No parameters; placeholder for future kernel-generation logic.
-def kernel(x, y, frequency, theta, bandwidth):
+def kernel(x, y, frequency, theta, bandwidth, sine=False):
     xr = x * np.cos(theta) + y * np.sin(theta)
     yr = -x * np.sin(theta) + y * np.cos(theta)
     gaussian = np.exp(-np.pi * bandwidth**2 * (xr**2 + yr**2))
-    return gaussian * np.cos(2 * np.pi * frequency * xr)
+    carrier = np.sin if sine else np.cos
+    return gaussian * carrier(2 * np.pi * frequency * xr)
 
 
 
@@ -893,23 +896,47 @@ def extract_bandwidth(gray_img, power_spectrum):
     bandwidth = np.log2((k + 1) / (k - 1))
     return f0, bandwidth
 
-def synthesize_variation(shape, lobes, n_impulses=4000, seed=None):
+def synthesize_variation(shape, lobes, n_impulses=None, impulses_per_kernel=12.0, seed=None):
+    """Sparse-convolution Gabor noise, one impulse field per spectral lobe.
+
+    n_impulses: optional total impulse budget split by lobe weight.  By default
+    each lobe gets impulses_per_kernel impulses under one kernel footprint
+    (area 1/bandwidth^2); with ~1 or fewer you only get isolated dots.
+    Each lobe is standardised and weighted by sqrt(weight), so the result has
+    unit variance.
+    """
     rng = np.random.default_rng(seed)
     height, width = shape
     out = np.zeros(shape)
 
-    xs, ys = np.meshgrid(np.arange(width) - width/2, np.arange(height) - height/2)
+    # kernel sampled with its origin at [0, 0] so the FFT product is a circular convolution
+    xs, ys = np.meshgrid(np.fft.fftfreq(width, 1.0 / width), np.fft.fftfreq(height, 1.0 / height))
     for lobe in lobes:
-        n = int(n_impulses * lobe["weight"])
-        for _ in range(n):
-            cx, cy = rng.uniform(-width/2, width/2), rng.uniform(-height/2, height/2)
-            phase = rng.uniform(0, 2*np.pi)
-            ori = lobe["orientation"] + rng.normal(0, 0.05)  # jitter
-            out += kernel(xs - cx, ys - cy, lobe["freq"], ori, lobe["bandwidth"]) * np.cos(phase)
+        if n_impulses is None:
+            expected = impulses_per_kernel * height * width * lobe["bandwidth"] ** 2
+        else:
+            expected = n_impulses * lobe["weight"]
+        n = rng.poisson(expected)
+        if n == 0:
+            continue
+        rows = rng.integers(0, height, n)
+        cols = rng.integers(0, width, n)
+        phase = rng.uniform(0, 2 * np.pi, n)
+        field_cos = np.zeros(shape)
+        field_sin = np.zeros(shape)
+        np.add.at(field_cos, (rows, cols), np.cos(phase))
+        np.add.at(field_sin, (rows, cols), np.sin(phase))
+        k_cos = kernel(xs, ys, lobe["freq"], lobe["orientation"], lobe["bandwidth"])
+        k_sin = kernel(xs, ys, lobe["freq"], lobe["orientation"], lobe["bandwidth"], sine=True)
+        # Re[e^{i phase} * g(x) e^{i 2 pi f x}] = cos(phase) * cos-part - sin(phase) * sin-part
+        band = np.real(
+            np.fft.ifft2(np.fft.fft2(field_cos) * np.fft.fft2(k_cos))
+            - np.fft.ifft2(np.fft.fft2(field_sin) * np.fft.fft2(k_sin))
+        )
+        band /= band.std() + 1e-12
+        out += np.sqrt(lobe["weight"]) * band
     return out
 
 
 if __name__ == "__main__":
     userInputMode()
-
-    

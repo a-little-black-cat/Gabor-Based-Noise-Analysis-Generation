@@ -12,6 +12,47 @@ source = None
 gray_img = None
 
 
+def _gabor_kernel_l2(frequency, theta, sigma_x, sigma_y, n_stds=3.5):
+    """Complex Gabor kernel (skimage convention) normalised to unit L2 energy.
+
+    skimage's gabor_kernel is normalised to unit envelope *area*, so its output
+    level changes with sigma and small sigmas always win an energy ranking.
+    Unit L2 energy makes every band comparable (white noise -> energy 1).
+    """
+    half_x = int(np.ceil(n_stds * max(abs(sigma_x * np.cos(theta)), abs(sigma_y * np.sin(theta)), 1)))
+    half_y = int(np.ceil(n_stds * max(abs(sigma_y * np.cos(theta)), abs(sigma_x * np.sin(theta)), 1)))
+    y, x = np.mgrid[-half_y:half_y + 1, -half_x:half_x + 1]
+    xr = x * np.cos(theta) + y * np.sin(theta)
+    yr = -x * np.sin(theta) + y * np.cos(theta)
+    g = np.exp(-0.5 * (xr**2 / sigma_x**2 + yr**2 / sigma_y**2)) * np.exp(1j * 2 * np.pi * frequency * xr)
+    return g / np.sqrt(np.sum(np.abs(g) ** 2))
+
+
+def sigma_for_frequency(frequency, bandwidth_octaves=1.0, aspect=1.6):
+    """Envelope sigmas (pixels) tied to the carrier wavelength (constant Q)."""
+    k = (2.0**bandwidth_octaves + 1.0) / (2.0**bandwidth_octaves - 1.0)
+    sigma_x = np.sqrt(np.log(2) / 2.0) / np.pi * k / frequency
+    return float(sigma_x), float(sigma_x * aspect)
+
+
+def _circular_filter(field, kernel):
+    """Circular (wrap-around) convolution via FFT; output has field's shape."""
+    height, width = field.shape
+    padded = np.zeros((height, width), dtype=np.complex128)
+    kernel_height, kernel_width = kernel.shape
+    padded[:kernel_height, :kernel_width] = kernel
+    padded = np.roll(padded, (-(kernel_height // 2), -(kernel_width // 2)), axis=(0, 1))
+    return np.fft.ifft2(np.fft.fft2(field) * np.fft.fft2(padded))
+
+
+def _rank_normalize(values):
+    """Map values to (0, 1) by rank (histogram equalisation); outlier-proof."""
+    flat = values.ravel()
+    ranks = np.empty(flat.size, dtype=np.float64)
+    ranks[np.argsort(flat, kind="stable")] = (np.arange(flat.size) + 0.5) / flat.size
+    return ranks.reshape(values.shape)
+
+
 def export_gabor_kernels_csv(kernels, file_path):
     """Export kernel coefficients as one row per coefficient."""
     with open(file_path, "w", newline="", encoding="utf-8") as csv_file:
@@ -23,7 +64,7 @@ def export_gabor_kernels_csv(kernels, file_path):
 
 
 
-def extract_gabor_parameters(image, max_components=8):
+def extract_gabor_parameters(image, max_components=None, n_frequencies=6, n_orientations=8):
     """Extract JSON-friendly noise and appearance parameters from an image."""
     global gray_img
     global source
@@ -42,55 +83,43 @@ def extract_gabor_parameters(image, max_components=8):
     gray_img /= gray_img.std() + 1e-8
 
     power_spectrum = get_power_spectrum()
-    dominant_frequencies = estimate_dominant_frequencies(
-        power_spectrum,
-        num_frequencies=5,
-    )
-    dominant_values = [
-        item["frequency"]
-        for item in dominant_frequencies
-        if item["frequency"] > 0.0
-    ]
-    if dominant_values:
-        frequency_min = max(0.01, min(dominant_values) * 0.7)
-        frequency_max = min(0.45, max(dominant_values) * 1.3)
-        if frequency_max <= frequency_min:
-            frequency_min, frequency_max = 0.02, 0.45
-    else:
-        frequency_min, frequency_max = 0.02, 0.45
-    frequencies = np.geomspace(frequency_min, frequency_max, 12)
-    orientations = np.arange(8, dtype=np.float32) * np.pi / 8
-    sigmas = ((1.0, 1.0), (2.0, 1.0), (3.0, 2.0), (5.0, 2.0), (7.0, 3.0))
-    candidates = []
-    for frequency in frequencies:
-        for theta in orientations:
-            for sigma_x, sigma_y in sigmas:
-                kernel = gabor_kernel(
-                    frequency, theta=theta, sigma_x=sigma_x, sigma_y=sigma_y
-                )
-                real = ndi.convolve(gray_img, np.real(kernel), mode="wrap")
-                imaginary = ndi.convolve(gray_img, np.imag(kernel), mode="wrap")
-                energy = float(np.mean(real * real + imaginary * imaginary))
-                candidates.append({
-                    "frequency": float(frequency),
-                    "theta": float(theta),
-                    "sigma_x": float(sigma_x),
-                    "sigma_y": float(sigma_y),
-                    "energy": energy,
-                    "response_std": float(np.sqrt(energy)),
-                })
 
-    candidates.sort(key=lambda item: item["energy"], reverse=True)
+    # Measure how much variance sits in each (frequency, orientation) band of a
+    # constant-Q filter bank.  The whole bank is kept and weighted by its share,
+    # instead of keeping the top-N raw energies (which always picked the lowest
+    # frequency and the smallest sigma).  A Hann window removes the false
+    # horizontal/vertical cross that edge discontinuities add to the spectrum.
+    height, width = gray_img.shape
+    window = np.outer(np.hanning(height), np.hanning(width))
+    windowed = gray_img * window
+    window_power = float(np.mean(window**2))
+    frequencies = np.geomspace(0.02, 0.4, n_frequencies)
+    orientations = np.arange(n_orientations, dtype=np.float32) * np.pi / n_orientations
     components = []
-    for candidate in candidates:
-        if all(
-            abs(candidate["frequency"] - selected["frequency"]) > 0.015
-            or abs(candidate["theta"] - selected["theta"]) > np.pi / 16
-            for selected in components
-        ):
-            components.append(candidate)
-        if len(components) == max_components:
-            break
+    for frequency in frequencies:
+        sigma_x, sigma_y = sigma_for_frequency(frequency)
+        for theta in orientations:
+            kernel = _gabor_kernel_l2(frequency, theta, sigma_x, sigma_y)
+            if max(kernel.shape) > min(height, width):
+                continue  # kernel larger than the image: band not measurable
+            response = _circular_filter(windowed, kernel)
+            energy = float(np.mean(np.abs(response) ** 2) / window_power)
+            components.append({
+                "frequency": float(frequency),
+                "theta": float(theta),
+                "sigma_x": sigma_x,
+                "sigma_y": sigma_y,
+                "energy": energy,
+                "response_std": float(np.sqrt(energy)),
+            })
+    if not components:
+        raise ValueError("Image is too small for the Gabor filter bank")
+    total_energy = sum(item["energy"] for item in components) + 1e-12
+    for item in components:
+        item["share"] = item["energy"] / total_energy
+    components.sort(key=lambda item: item["energy"], reverse=True)
+    if max_components:
+        components = components[:max_components]
 
     rgb = cv.cvtColor(image_float, cv.COLOR_BGR2RGB)
     luminance = cv.cvtColor(image_float, cv.COLOR_BGR2GRAY)
@@ -246,7 +275,8 @@ def generate_gabor_noise(
     use_all_components=True,
     frequency_scale=1.0,
     sigma_scale=1.0,
-    density_scale=0.1,
+    density_scale=1.0,
+    impulses_per_kernel=12.0,
     envelope_size=None,
     subbands=None,
 ):
@@ -259,9 +289,12 @@ def generate_gabor_noise(
     ``1 / sqrt(lambda) * sum(g(x - x_i, phi_i))``.
 
     ``poisson_density`` is the expected number of impulses per pixel.  When it
-    is not present in the extracted parameters, a fraction of the component
-    frequency is used as a sparse default.  ``lambda`` is also accepted as an
-    alias for ``poisson_density``.
+    is not present in the extracted parameters, the density is chosen so that
+    about ``impulses_per_kernel * density_scale`` impulses fall under one
+    kernel footprint (10+ gives continuous noise; ~0.1 gives isolated dots).
+    ``lambda`` is also accepted as an alias for ``poisson_density``.
+    Each component is standardised to unit variance and weighted by
+    ``sqrt(energy share)``, so the output has unit variance overall.
 
     ``sigma_x`` and ``sigma_y`` are the envelope standard deviations in pixels.
     ``envelope_size`` can override them globally as a scalar or ``(x, y)`` pair.
@@ -342,12 +375,6 @@ def generate_gabor_noise(
             sigma_y = float(
                 component.get("sigma_y", gabor_parameters.get("sigma_y", 1.0))
             ) * sigma_scale
-        amplitude = float(
-            component.get(
-                "response_std",
-                component.get("noise_amplitude", gabor_parameters.get("noise_amplitude", 1.0)),
-            )
-        )
         if frequency <= 0.0 or sigma_x <= 0.0 or sigma_y <= 0.0:
             raise ValueError("Gabor frequency and sigmas must be positive")
 
@@ -364,7 +391,7 @@ def generate_gabor_noise(
         density = (
             float(explicit_density)
             if explicit_density is not None
-            else frequency * component_density_scale
+            else component_density_scale * impulses_per_kernel / (2.0 * np.pi * sigma_x * sigma_y)
         )
         if density <= 0.0:
             raise ValueError("poisson_density must be positive")
@@ -381,18 +408,15 @@ def generate_gabor_noise(
                 np.exp(1j * phases).astype(np.complex64),
             )
 
-        kernel = gabor_kernel(
+        kernel = _gabor_kernel_l2(
             frequency,
-            theta=float(component.get("theta", gabor_parameters.get("theta", 0.0))),
-            sigma_x=sigma_x,
-            sigma_y=sigma_y,
+            float(component.get("theta", gabor_parameters.get("theta", 0.0))),
+            sigma_x,
+            sigma_y,
         )
-        response = ndi.convolve(impulse_field, kernel, mode="wrap")
-        generated += (
-            weight
-            * amplitude
-            * np.real(response / np.sqrt(density)).astype(np.float32)
-        )
+        band = np.real(_circular_filter(impulse_field, kernel))
+        band /= band.std() + 1e-12
+        generated += (np.sqrt(weight) * band).astype(np.float32)
 
     return generated
 
@@ -401,21 +425,32 @@ def gabor_function(x, K, a, w, phi):
     return K * np.exp(-np.pi * a**2 * np.abs(x)**2) * np.cos(2 * np.pi * w * x + phi)
 
 def colorize_gabor_noise(gray_gabor_noise, parameters):
+    """Colour noise with the extracted palette; always returns uint8 RGB.
+
+    The noise is rank-normalised (outlier-proof, unlike min-max), the palette
+    is sorted by luminance, and each colour covers a span of the ranks equal to
+    its palette frequency, so colour proportions match the source image.
+    """
     palette = parameters.get("palette", [])
+    ranks = _rank_normalize(np.asarray(gray_gabor_noise, dtype=np.float64))
 
     if not palette:
-        gray = normalize(gray_gabor_noise)
+        gray = np.uint8(np.clip(ranks * 255.0, 0, 255))
         return np.repeat(gray[:, :, np.newaxis], 3, axis=2)
-    palette_rgb = np.asarray(
-        [color["rgb"] for color in palette], dtype=np.float32
-    ) / 255.0
 
-    gray = normalize(gray_gabor_noise)
-    positions = np.linspace(0.0, 1.0, len(palette_rgb))
-    output = np.empty((*gray.shape, 3), dtype=np.float32)
+    palette_rgb = np.asarray([color["rgb"] for color in palette], dtype=np.float32) / 255.0
+    weights = np.asarray([float(color.get("frequency", 1.0)) for color in palette], dtype=np.float64)
+    weights = weights / (weights.sum() + 1e-12)
+    luminance = (
+        0.2126 * palette_rgb[:, 0] + 0.7152 * palette_rgb[:, 1] + 0.0722 * palette_rgb[:, 2]
+    )
+    order = np.argsort(luminance)
+    palette_rgb, weights = palette_rgb[order], weights[order]
+    positions = np.cumsum(weights) - weights / 2.0  # centre of each colour's rank span
 
+    output = np.empty((*ranks.shape, 3), dtype=np.float32)
     for channel in range(3):
-        output[..., channel] = np.interp(gray, positions, palette_rgb[:, channel])
+        output[..., channel] = np.interp(ranks, positions, palette_rgb[:, channel])
     return np.uint8(np.clip(output * 255.0, 0, 255))
 
 def estimate_dominant_frequencies(
