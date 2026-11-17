@@ -937,6 +937,15 @@ def synthesize_variation(shape, lobes, n_impulses=None, impulses_per_kernel=12.0
         out += np.sqrt(lobe["weight"]) * band
     return out
 
+"""
+Ensure it gets generator trained params
+
+break linearity: find the dominant frequency bands in the power spectrum
+use them to generate a sparse convolution of Gabor kernels, each with a random impulse fields
+"""
+
+
+
 
 if __name__ == "__main__":
     userInputMode()

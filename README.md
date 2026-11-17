@@ -25,6 +25,25 @@ convolutions and PixelNorm, avoiding transposed-convolution checkerboards and
 BatchNorm moving-statistic drift. Training samples random crops with horizontal
 and vertical flips. Generated samples include a border margin that is cropped
 before saving and scoring, and Optuna ranks trials by Gabor texture distance.
+Final output generation also writes `source_grayscale_gabor_noise.png` and
+`source_colorized_gabor_noise.png`, which are Gabor-noise baselines generated
+directly from the source image's extracted parameters. The existing
+`grayscale_gabor_noise.png` and `colorized_gabor_noise.png` files use parameters
+extracted from the first GAN sample.
+The outputs `heeger_bergen_noise.png` and `source_heeger_bergen.png` are
+grayscale Heeger-Bergen syntheses using the GAN sample and source image,
+respectively. They provide a multiscale/orientation-aware comparison that can
+preserve structures such as cracks more effectively than the Gabor-only
+reconstruction.
+The outputs `plenoptic_noise.png` and `source_plenoptic.png` use plenoptic's
+Portilla-Simoncelli statistics and metamer optimization on those same two
+inputs. The original custom Heeger-Bergen outputs remain enabled for direct
+comparison. Plenoptic synthesis can be shortened for testing with
+`--plenoptic-iterations`.
+The plenoptic path uses a conservative local correlation window and a larger
+optimization budget to reduce grid/checkerboard artifacts. Its default
+iteration budget is 250; increase it for higher-fidelity synthesis when
+runtime permits.
 
 Training is memory-bounded by default: trials use patches up to 128px, three
 Optuna trials, 16 batches per epoch, and batches of at most 32 images. You can

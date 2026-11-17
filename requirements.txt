@@ -8,3 +8,4 @@ tensorflow; sys_platform == "win32"
 tensorflow[and-cuda]; sys_platform != "win32"
 optuna
 matplotlib
+plenoptic

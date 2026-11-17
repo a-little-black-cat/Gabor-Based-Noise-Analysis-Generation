@@ -11,7 +11,9 @@ os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
 sys.path.insert(0, str(Path(__file__).parent / "gabor noise" / "Model"))
 sys.path.insert(0, str(Path(__file__).parent / "gabor noise"))
+sys.path.insert(0, str(Path(__file__).parent / "heeger_bergen"))
 import cv2 as cv
+from heeger_bergen import heeger_bergen
 import gabor_extractor
 import numpy as np
 import optuna
@@ -75,11 +77,98 @@ def parse_args():
         default=1,
         help="Number of generated samples for output-only mode",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility (default: 42)",
+    )
+
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print additional debug information during training",
+    )
+
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=32,
+        help="Stride for patch extraction during training (default: 32)",
+    )
+    parser.add_argument(
+        "--plenoptic-iterations",
+        type=int,
+        default=250,
+        help="Portilla-Simoncelli synthesis iterations (default: 250)",
+    )
     return parser.parse_args()
 
 
 def write_state(path, state):
     path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def generate_heeger_bergen_image(image, output_shape, seed):
+    image_gray = cv.cvtColor(image, cv.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    synthesized = heeger_bergen(
+        image_gray,
+        out_shape=output_shape,
+        n_scales=4,
+        n_orient=4,
+        n_iter=5,
+        seed=seed,
+    )
+    return np.uint8(np.clip(synthesized, 0.0, 1.0) * 255)
+
+
+def generate_plenoptic_image(image, output_shape, seed, iterations):
+    try:
+        import plenoptic as po
+        import torch
+    except ImportError as error:
+        raise RuntimeError(
+            "Portilla-Simoncelli output requires the `plenoptic` package and "
+            "PyTorch. Install project requirements in the active environment."
+        ) from error
+
+    image_gray = cv.cvtColor(image, cv.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    target = torch.from_numpy(image_gray).unsqueeze(0).unsqueeze(0)
+    if tuple(output_shape) != tuple(image_gray.shape):
+        target = torch.nn.functional.interpolate(
+            target,
+            size=output_shape,
+            mode="bilinear",
+            align_corners=False,
+        )
+    torch.manual_seed(seed)
+    target = target.contiguous()
+    n_scales = min(4, int(np.log2(min(target.shape[-2:]))))
+    lowpass_size = min(target.shape[-2:]) // (2**n_scales)
+    spatial_corr_width = min(5, lowpass_size)
+    if spatial_corr_width % 2 == 0:
+        spatial_corr_width -= 1
+    model = po.models.PortillaSimoncelli(
+        target.shape[-2:],
+        n_scales=n_scales,
+        n_orientations=4,
+        spatial_corr_width=max(1, spatial_corr_width),
+    ).eval()
+    loss = po.loss.portilla_simoncelli_loss_factory(model, target)
+    metamer = po.Metamer(target, model, loss_function=loss)
+    metamer.setup(
+        optimizer=torch.optim.LBFGS,
+        optimizer_kwargs={
+            "max_iter": 5,
+            "max_eval": 5,
+            "history_size": 20,
+            "line_search_fn": "strong_wolfe",
+            "lr": 1,
+        },
+    )
+    metamer.synthesize(max_iter=iterations, store_progress=False)
+    synthesized = metamer.metamer.detach().cpu().squeeze().numpy()
+    return np.uint8(np.clip(synthesized, 0.0, 1.0) * 255)
 
 
 def configure_device(require_gpu=False):
@@ -104,11 +193,15 @@ def generate_outputs(
     source_height,
     source_width,
     output_directory,
+    source_path,
+    source_gabor_parameters,
+    seed=42,
     num_images=1,
+    plenoptic_iterations=250,
 ):
     generated_images = trainer.generate(
         count=num_images,
-        seed=42,
+        seed=seed,
         crop_margin=trainer.patch_size // 16,
     ).numpy()
     for index, image in enumerate(generated_images):
@@ -147,6 +240,61 @@ def generate_outputs(
         np.uint8(grayscale_image * 255),
     )
     cv.imwrite(str(output_directory / "colorized_gabor_noise.png"), generated_rgb)
+
+    source_grayscale_image = gabor_extractor.generate_gabor_noise(
+        source_height,
+        source_width,
+        source_gabor_parameters,
+        seed=42,
+    )
+    source_rgb = gabor_extractor.colorize_gabor_noise(
+        source_grayscale_image,
+        source_gabor_parameters,
+    )
+    cv.imwrite(
+        str(output_directory / "source_grayscale_gabor_noise.png"),
+        np.uint8(source_grayscale_image * 255),
+    )
+    cv.imwrite(
+        str(output_directory / "source_colorized_gabor_noise.png"),
+        source_rgb,
+    )
+
+    source_image = np.asarray(Image.open(source_path).convert("RGB"))
+    Image.fromarray(
+        generate_heeger_bergen_image(
+            generated_image,
+            (source_height, source_width),
+            seed,
+        ),
+        mode="L",
+    ).save(output_directory / "heeger_bergen_noise.png")
+    Image.fromarray(
+        generate_heeger_bergen_image(
+            source_image,
+            (source_height, source_width),
+            seed,
+        ),
+        mode="L",
+    ).save(output_directory / "source_heeger_bergen.png")
+    Image.fromarray(
+        generate_plenoptic_image(
+            generated_image,
+            (source_height, source_width),
+            seed,
+            plenoptic_iterations,
+        ),
+        mode="L",
+    ).save(output_directory / "plenoptic_noise.png")
+    Image.fromarray(
+        generate_plenoptic_image(
+            source_image,
+            (source_height, source_width),
+            seed,
+            plenoptic_iterations,
+        ),
+        mode="L",
+    ).save(output_directory / "source_plenoptic.png")
     return final_gabor_parameters
 
 
@@ -160,6 +308,8 @@ def main():
         raise ValueError("--epochs must be at least 1")
     if args.num_images < 1:
         raise ValueError("--num-images must be at least 1")
+    if args.plenoptic_iterations < 1:
+        raise ValueError("--plenoptic-iterations must be at least 1")
     configure_device(require_gpu=args.require_gpu)
     if args.gen_output_only and (args.from_save_state or args.clear):
         raise ValueError(
@@ -219,7 +369,10 @@ def main():
             source_height,
             source_width,
             output_directory,
+            source_path,
+            source_parameters,
             num_images=args.num_images,
+            plenoptic_iterations=args.plenoptic_iterations,
         )
         print("Final Gabor parameters of generated image:", final_gabor_parameters)
         print("Generated outputs using saved model state.")
@@ -243,10 +396,10 @@ def main():
 
     source_parameters = gabor_extractor.extract_gabor_parameters(source_path)
     hyperparameters = {
-        "patch_size": [64, 128, 256, 512],
+        "patch_size": [32, 64, 128, 256, 512],
         "latent_dim": [64, 128, 256, 512],
         "epochs": [100, 200, 300, 400, 500, 1000],
-        "stride": [16, 32, 64, 128],
+        "stride": [8, 16, 32, 64, 128],
         "batch_size": [8, 16, 32],
         "learning_rate": [1e-5, 5e-5, 1e-4, 2e-4, 5e-4, 1e-3],
         "sample_interval": [5, 10, 20, 50],
@@ -367,7 +520,10 @@ def main():
         source_height,
         source_width,
         output_directory,
+        source_path,
+        source_parameters,
         num_images=args.num_images,
+        plenoptic_iterations=args.plenoptic_iterations,
     )
 
     print("Final generator loss:", history["generator_loss"][-1])
