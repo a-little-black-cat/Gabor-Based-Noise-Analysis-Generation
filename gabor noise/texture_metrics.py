@@ -33,3 +33,4 @@ def gabor_texture_distance(reference, generated):
     generated_features = _features(generated)
     scale = np.maximum(np.abs(reference_features), 1e-3)
     return float(np.mean(np.abs(reference_features - generated_features) / scale))
+

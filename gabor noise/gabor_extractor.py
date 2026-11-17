@@ -1,13 +1,19 @@
 """Feature extraction for creating variations of uploaded texture images."""
 
 import csv
+import io
+import json
 import os
 
 import cv2 as cv
 import numpy as np
+from PIL import Image
 from scipy import ndimage as ndi
 from skimage.filters import gabor_kernel
-from pylette import extract_colors
+try:
+    from pylette import extract_colors
+except ModuleNotFoundError:
+    from Pylette import extract_colors
 source = None
 gray_img = None
 
@@ -151,9 +157,13 @@ def extract_gabor_parameters(image, max_components=None, n_frequencies=6, n_orie
         "palette": [
             {
                 "rgb": color.rgb,
-                "hex": color.hex,
+                "hex": getattr(
+                    color,
+                    "hex",
+                    "#{:02x}{:02x}{:02x}".format(*color.rgb),
+                ),
                 "hsv": color.hsv,
-                "frequency": float(color.frequency),
+                "frequency": float(getattr(color, "frequency", color.freq)),
             }
             for color in palette.colors
         ],
@@ -171,13 +181,54 @@ def compute_feats(image, kernels):
     return feats
 
 def extract_palette_from_image(image, max_num_colors=8):
-    palette = extract_colors(image, max_num_colors)
+    try:
+        palette = extract_colors(image, max_num_colors)
+    except AttributeError:
+        image_buffer = io.BytesIO()
+        Image.fromarray(image).save(image_buffer, format="PNG")
+        image_buffer.seek(0)
+        palette = extract_colors(image_buffer, max_num_colors)
     for color in palette.colors:
+        color_hex = getattr(color, "hex", None)
+        if color_hex is None:
+            color_hex = "#{:02x}{:02x}{:02x}".format(
+                *(int(value) for value in color.rgb)
+            )
+        color_frequency = getattr(color, "frequency", None)
+        if color_frequency is None:
+            color_frequency = color.freq
         print(f"RGB: {color.rgb}")
-        print(f"Hex: {color.hex}")
+        print(f"Hex: {color_hex}")
         print(f"HSV: {color.hsv}")
-        print(f"Frequency: {color.frequency:.2%}")
-    palette.to_json(filename="palette.json", colorspace='hsv')
+        print(f"Frequency: {color_frequency:.2%}")
+    if hasattr(palette, "to_json"):
+        palette.to_json(filename="palette.json", colorspace="hsv")
+    else:
+        colors = []
+        for color in palette.colors:
+            color_frequency = getattr(color, "frequency", None)
+            if color_frequency is None:
+                color_frequency = color.freq
+            colors.append(
+                {
+                    "frequency": float(color_frequency),
+                    "hsv": [float(value) for value in color.hsv],
+                    "hex": "#{:02x}{:02x}{:02x}".format(
+                        *(int(value) for value in color.rgb)
+                    ),
+                    "rgb": [int(value) for value in color.rgb],
+                }
+            )
+        with open("palette.json", "w", encoding="utf-8") as palette_file:
+            json.dump(
+                {
+                    "colors": colors,
+                    "palette_size": len(colors),
+                    "colorspace": "hsv",
+                },
+                palette_file,
+                indent=2,
+            )
     return palette
 
 def create_color_variation(image, color_mean=None, color_std=None, palette=None):
